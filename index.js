@@ -9,6 +9,7 @@ const cors = require("cors");
 const mongoose = require("mongoose");
 const User = require("./src/models/userSchema");
 const Order = require("./src/models/OrderSchema");
+const Weather = require("./src/models/WeatherSchema"); // Add this import
 const SocketService = require("./src/services/socketService");
 
 const app = express();
@@ -570,12 +571,16 @@ app.get("/api/get/order-depth/:bidId", async (req, res) => {
       const remainingQuantity = order.quantity - (order.filledQuantity || 0);
       if (remainingQuantity <= 0) return; // Skip fully filled orders
 
-      const key = `${order.optionKey}_${order.price}`;
+      // FIXED: Show opposite option at complementary price
+      const complementaryPrice = 10 - order.price;
+      const oppositeOption = order.optionKey === "Yes" ? "No" : "Yes";
+
+      const key = `${oppositeOption}_${complementaryPrice}`;
       if (!priceGroups[key]) {
         priceGroups[key] = {
-          price: order.price,
+          price: complementaryPrice,
           quantity: 0,
-          option: order.optionKey,
+          option: oppositeOption,
         };
       }
       priceGroups[key].quantity += remainingQuantity;
@@ -788,6 +793,100 @@ app.post("/api/resolve-event", async (req, res) => {
     console.error("Error resolving event:", error);
     res.status(500).json({
       error: "Internal server error",
+      details: error.message,
+    });
+  }
+});
+
+// NEW: Weather API Routes
+
+// Get current weather data from database - UPDATE THIS ENDPOINT
+app.get("/api/get/weather", async (req, res) => {
+  try {
+    // Get last 4 weather records instead of just 1
+    const weatherRecords = await Weather.find({ isActive: true })
+      .sort({ createdAt: -1 })
+      .limit(4);
+
+    if (!weatherRecords || weatherRecords.length === 0) {
+      return res.status(404).json({
+        error: "No weather data available",
+        message: "Please update market data first",
+      });
+    }
+
+    res.status(200).json({ weatherHistory: weatherRecords });
+  } catch (error) {
+    console.error("Error fetching weather:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Admin endpoint to fetch and store new weather data
+app.post("/api/admin/update-weather", async (req, res) => {
+  try {
+    const { clerkId } = req.body;
+    const socketService = req.app.get("socketService");
+
+    // Validate admin access
+    if (clerkId !== "user_31EJ9jzTGNPdgsTBT6YFl96E8of") {
+      return res
+        .status(403)
+        .json({ error: "Unauthorized: Admin access required" });
+    }
+
+    // Get API key from environment variable
+    const API_KEY = process.env.WEATHERSTACK_API_KEY;
+    if (!API_KEY) {
+      return res.status(500).json({
+        error: "Weather API key not configured",
+        message: "Please set WEATHERSTACK_API_KEY in environment variables",
+      });
+    }
+
+    // Fetch weather data from WeatherStack API
+    const fetch = require("node-fetch"); // You might need to install: npm install node-fetch@2
+    const response = await fetch(
+      `http://api.weatherstack.com/current?access_key=${API_KEY}&query=New%20Delhi`
+    );
+
+    if (!response.ok) {
+      throw new Error(`WeatherStack API error: ${response.status}`);
+    }
+
+    const weatherApiData = await response.json();
+
+    if (weatherApiData.error) {
+      throw new Error(weatherApiData.error.info || "Weather API error");
+    }
+
+    // Create new weather record in database
+    const newWeather = new Weather({
+      location: weatherApiData.location,
+      current: weatherApiData.current,
+      fetchedAt: new Date(),
+      isActive: true,
+    });
+
+    await newWeather.save();
+
+    // Emit weather update to all connected users
+    socketService.emitWeatherUpdate({
+      weather: newWeather,
+      message: "Weather data updated",
+      updatedBy: "Admin",
+      timestamp: new Date(),
+    });
+
+    res.status(200).json({
+      message: "Weather data updated successfully",
+      weather: newWeather,
+      timestamp: new Date(),
+    });
+  } catch (error) {
+    console.error("Error updating weather:", error);
+    res.status(500).json({
+      error: "Failed to update weather data",
       details: error.message,
     });
   }

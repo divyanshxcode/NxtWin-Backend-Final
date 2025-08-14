@@ -37,7 +37,7 @@ class SocketService {
     this.io.to(`bid_${bidId}`).emit("priceUpdate", priceData);
   }
 
-  // Emit order book updates - NEW METHOD
+  // Emit order book updates - FIXED METHOD
   async emitOrderBookUpdate(bidId) {
     try {
       const Order = require("../models/OrderSchema");
@@ -59,12 +59,16 @@ class SocketService {
         const remainingQuantity = order.quantity - (order.filledQuantity || 0);
         if (remainingQuantity <= 0) return; // Skip fully filled orders
 
-        const key = `${order.optionKey}_${order.price}`;
+        // FIXED: Show opposite option at complementary price
+        const complementaryPrice = 10 - order.price;
+        const oppositeOption = order.optionKey === "Yes" ? "No" : "Yes";
+
+        const key = `${oppositeOption}_${complementaryPrice}`;
         if (!priceGroups[key]) {
           priceGroups[key] = {
-            price: order.price,
+            price: complementaryPrice,
             quantity: 0,
-            option: order.optionKey,
+            option: oppositeOption,
           };
         }
         priceGroups[key].quantity += remainingQuantity;
@@ -185,6 +189,12 @@ class SocketService {
     } catch (error) {
       console.error("Error emitting dynamic pricing update:", error);
     }
+  }
+
+  // NEW: Emit weather updates to all connected users
+  emitWeatherUpdate(weatherData) {
+    this.io.emit("weatherUpdate", weatherData);
+    console.log("Weather update emitted to all users");
   }
 }
 
