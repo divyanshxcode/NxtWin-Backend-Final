@@ -13,12 +13,12 @@ const connectDB = require("./src/config/db");
 const SAMPLE = [
   {
     question:
-      "Will the temperature in Delhi be above 38°C before 13 Aug 11:59PM?",
+      "Will the temperature in Delhi be above 38°C before 15 Aug 11:59PM?",
     category: "General",
     yesPrice: 5.0, // Converted from 62%
     volume: 0,
     participants: 0,
-    deadline: "Closes at 13-8-25, 11:59 PM",
+    deadline: "Closes at 15-8-25, 11:59 PM",
     image: "/Delhi.jpg",
   },
   {
@@ -40,7 +40,7 @@ const SAMPLE = [
     image: "/jeff.jpg",
   },
   {
-    question: "Ethereum above $3800 on August 13?",
+    question: "Ethereum above $3800 on August 17?",
     category: "Crypto",
     yesPrice: 5.0, // Converted from 22%
     volume: 0,

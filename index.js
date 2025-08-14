@@ -11,6 +11,7 @@ const User = require("./src/models/userSchema");
 const Order = require("./src/models/OrderSchema");
 const Weather = require("./src/models/WeatherSchema"); // Add this import
 const SocketService = require("./src/services/socketService");
+const HouseBettingService = require("./src/services/houseBettingService"); // Add this import
 
 const app = express();
 const server = http.createServer(app);
@@ -201,7 +202,7 @@ const executeMatchedOrders = async (order1, order2, socketService) => {
   return executeQuantity;
 };
 
-// Order Related Routes - Updated with better order flow
+// Updated Order Related Routes - FIXED LOGIC ORDER
 app.post("/api/order", async (req, res) => {
   try {
     const { bidId, clerkId, optionKey, price, quantity } = req.body;
@@ -276,7 +277,7 @@ app.post("/api/order", async (req, res) => {
       return res.status(400).json({ error: "Insufficient balance" });
     }
 
-    // Create new order
+    // Create new order (always create as pending first)
     const newOrder = new Order({
       bidId,
       clerkId,
@@ -295,33 +296,144 @@ app.post("/api/order", async (req, res) => {
     await user.save();
     console.log("User balance updated:", user.balance);
 
-    // Try to match orders with improved logic - NOW INCLUDES partly_filled orders
-    const matchingOrders = await findMatchingOrders(newOrder);
-    let remainingQuantity = newOrder.quantity;
+    // 🎯 NEW FIXED LOGIC: Check house betting FIRST (after placing the order)
+    let executionType = "pending";
+    let orderExecuted = false;
 
-    console.log(`Found ${matchingOrders.length} potential matching orders`);
+    console.log(
+      "🔍 Step 1: Checking if house betting is profitable for ALL pending orders..."
+    );
 
-    for (const matchingOrder of matchingOrders) {
-      if (remainingQuantity <= 0) break;
+    // 1. Check if executing ALL pending orders (including this new one) is profitable
+    const houseAnalysis =
+      await HouseBettingService.shouldExecuteAllPendingOrders(bidId);
 
-      const availableQuantity =
-        matchingOrder.quantity - (matchingOrder.filledQuantity || 0);
+    if (houseAnalysis.shouldExecute) {
       console.log(
-        `Matching order ${matchingOrder._id}: available quantity = ${availableQuantity}`
+        "🏠 House betting profitable! Executing ALL pending orders..."
       );
 
-      if (availableQuantity <= 0) continue;
-
-      const matchedQuantity = await executeMatchedOrders(
-        newOrder,
-        matchingOrder,
+      const houseResult = await HouseBettingService.executeAllPendingOrders(
+        bidId,
         socketService
       );
 
-      remainingQuantity -= matchedQuantity;
+      if (houseResult.executed) {
+        orderExecuted = true;
+        executionType = "house";
+
+        // Update bid volume for all executed orders
+        const volumeIncrease = houseResult.executedOrders.reduce(
+          (sum, order) => {
+            return sum + order.price * order.quantity;
+          },
+          0
+        );
+
+        bid.volume += volumeIncrease;
+        await bid.save();
+
+        // Emit platform metrics update
+        socketService.io.to(`bid_${bidId}`).emit("platformMetrics", {
+          bidId,
+          ...houseResult.metrics,
+          executionType: "house",
+          executedCount: houseResult.count,
+        });
+      }
+    } else {
       console.log(
-        `Matched ${matchedQuantity}, remaining: ${remainingQuantity}`
+        "🔄 House betting not profitable, trying traditional order matching..."
       );
+
+      // 2. If house betting not profitable, try traditional matching for this specific order
+      const matchingOrders = await findMatchingOrders(newOrder);
+      let remainingQuantity = newOrder.quantity;
+
+      console.log(`Found ${matchingOrders.length} potential matching orders`);
+
+      for (const matchingOrder of matchingOrders) {
+        if (remainingQuantity <= 0) break;
+
+        const availableQuantity =
+          matchingOrder.quantity - (matchingOrder.filledQuantity || 0);
+        console.log(
+          `Matching order ${matchingOrder._id}: available quantity = ${availableQuantity}`
+        );
+
+        if (availableQuantity <= 0) continue;
+
+        const matchedQuantity = await executeMatchedOrders(
+          newOrder,
+          matchingOrder,
+          socketService
+        );
+        remainingQuantity -= matchedQuantity;
+        console.log(
+          `Matched ${matchedQuantity}, remaining: ${remainingQuantity}`
+        );
+
+        // Update matched orders counter
+        await Bid.findByIdAndUpdate(bidId, {
+          $inc: { matchedOrders: 1 },
+        });
+      }
+
+      if (remainingQuantity < newOrder.quantity) {
+        orderExecuted = true;
+        executionType =
+          remainingQuantity === 0 ? "matched" : "partially_matched";
+
+        // Update bid volume for matched portion only
+        const matchedValue =
+          (newOrder.quantity - remainingQuantity) * newOrder.price;
+        bid.volume += matchedValue;
+        await bid.save();
+      }
+    }
+
+    // After any execution, check again if house betting becomes profitable
+    if (!orderExecuted || executionType === "partially_matched") {
+      console.log("🔄 Checking house betting again after matching...");
+
+      const secondHouseAnalysis =
+        await HouseBettingService.shouldExecuteAllPendingOrders(bidId);
+
+      if (secondHouseAnalysis.shouldExecute) {
+        console.log(
+          "🏠 House betting now profitable after matching! Executing remaining orders..."
+        );
+
+        const secondHouseResult =
+          await HouseBettingService.executeAllPendingOrders(
+            bidId,
+            socketService
+          );
+
+        if (secondHouseResult.executed) {
+          executionType = "house_after_matching";
+          orderExecuted = true;
+
+          // Update volume for additional executions
+          const additionalVolume = secondHouseResult.executedOrders.reduce(
+            (sum, order) => {
+              return sum + order.price * order.quantity;
+            },
+            0
+          );
+
+          bid.volume += additionalVolume;
+          await bid.save();
+
+          // Emit updated platform metrics
+          socketService.io.to(`bid_${bidId}`).emit("platformMetrics", {
+            bidId,
+            ...secondHouseResult.metrics,
+            executionType: "house_after_matching",
+            executedCount: secondHouseResult.count,
+          });
+        }
+      }
     }
 
     // Refresh the order from database to get latest status
@@ -339,24 +451,44 @@ app.post("/api/order", async (req, res) => {
         filledQuantity: newOrder.filledQuantity,
         status: newOrder.status,
         createdAt: newOrder.createdAt,
+        executionType,
       },
       optionKey,
-      message: "New order placed",
+      message: `Order ${
+        executionType.includes("house")
+          ? "executed by house"
+          : executionType === "matched"
+          ? "matched successfully"
+          : executionType === "partially_matched"
+          ? "partially matched"
+          : "placed"
+      }`,
       userName: user.name || `User${user.user_id.slice(-4)}`,
       userId: user.user_id,
+      executionType,
     };
 
     // Emit the updates
     socketService.emitOrderUpdate(bidId, orderDataWithUser);
     socketService.emitBalanceUpdate(clerkId, user.balance);
 
-    // Emit updated order book data (this will also emit pricing updates)
+    // Emit updated order book data
     socketService.emitOrderBookUpdate(bidId);
 
     res.status(201).json({
-      message: "Order placed successfully",
+      message: `Order ${
+        executionType.includes("house")
+          ? "executed immediately by house!"
+          : executionType === "matched"
+          ? "matched successfully!"
+          : executionType === "partially_matched"
+          ? "partially matched!"
+          : "placed successfully"
+      }`,
       order: newOrder,
       remainingBalance: user.balance,
+      executionType,
+      houseAnalysis: houseAnalysis.shouldExecute ? houseAnalysis.metrics : null,
     });
   } catch (error) {
     console.error("Error placing order:", error);
@@ -374,6 +506,26 @@ app.post("/api/order", async (req, res) => {
       error: "Internal server error",
       details: error.message,
     });
+  }
+});
+
+// NEW: Add endpoint to get platform metrics for a bid
+app.get("/api/get/platform-metrics/:bidId", async (req, res) => {
+  try {
+    const { bidId } = req.params;
+
+    const metrics = await HouseBettingService.calculateBidMetrics(bidId);
+    const bid = await Bid.findById(bidId);
+
+    res.status(200).json({
+      ...metrics,
+      houseExecutedOrders: bid?.houseExecutedOrders || 0,
+      matchedOrders: bid?.matchedOrders || 0,
+      bidVolume: bid?.volume || 0,
+    });
+  } catch (error) {
+    console.error("Error fetching platform metrics:", error);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
@@ -614,7 +766,7 @@ app.get("/api/get/order-depth/:bidId", async (req, res) => {
   }
 });
 
-// Add this route before the Socket.IO connection handling
+// Update the resolve-event endpoint
 app.post("/api/resolve-event", async (req, res) => {
   try {
     const { bidId, resolution, clerkId } = req.body;
@@ -657,26 +809,66 @@ app.post("/api/resolve-event", async (req, res) => {
     // Group users and their winnings/refunds
     const userPayouts = {};
     const userRefunds = {};
+    const userBalances = {}; // Store current balances
+
+    // Get current balances for all users involved BEFORE updating
+    const involvedUsers = [...new Set(allOrders.map((order) => order.clerkId))];
+    const users = await User.find({ user_id: { $in: involvedUsers } });
+
+    users.forEach((user) => {
+      userBalances[user.user_id] = user.balance; // Store current balance
+      userPayouts[user.user_id] = {
+        winnings: 0,
+        refunds: 0,
+        orders: [],
+        winningOrders: [],
+        losingOrders: [],
+        refundedOrders: [],
+        previousBalance: user.balance,
+        totalSpent: 0, // NEW: Track total amount spent on orders
+        totalReceived: 0, // NEW: Track total amount received back
+      };
+    });
 
     // Calculate winnings for filled orders
     filledOrders.forEach((order) => {
       const isWinner = order.optionKey === resolution;
+      const orderCost = order.price * order.quantity;
 
       if (!userPayouts[order.clerkId]) {
-        userPayouts[order.clerkId] = { winnings: 0, refunds: 0, orders: [] };
+        userPayouts[order.clerkId] = {
+          winnings: 0,
+          refunds: 0,
+          orders: [],
+          winningOrders: [],
+          losingOrders: [],
+          refundedOrders: [],
+          previousBalance: userBalances[order.clerkId] || 0,
+          totalSpent: 0,
+          totalReceived: 0,
+        };
       }
+
+      // Track total spent on this order
+      userPayouts[order.clerkId].totalSpent += orderCost;
 
       if (isWinner) {
         // Calculate winnings: cost + (10 - cost) * 0.9
-        const cost = order.price * order.quantity;
         const potentialReturn = order.quantity * 10; // Max payout is ₹10 per share
-        const winnings = cost + (potentialReturn - cost) * 0.9;
+        const winnings = orderCost + (potentialReturn - orderCost) * 0.9;
 
         userPayouts[order.clerkId].winnings += winnings;
+        userPayouts[order.clerkId].totalReceived += winnings;
         userPayouts[order.clerkId].orders.push({
           ...order.toObject(),
           winnings,
           type: "win",
+          orderCost,
+        });
+        userPayouts[order.clerkId].winningOrders.push({
+          ...order.toObject(),
+          winnings,
+          orderCost,
         });
       } else {
         // Losers get nothing for filled orders
@@ -684,7 +876,13 @@ app.post("/api/resolve-event", async (req, res) => {
           ...order.toObject(),
           winnings: 0,
           type: "loss",
+          orderCost,
         });
+        userPayouts[order.clerkId].losingOrders.push({
+          ...order.toObject(),
+          orderCost,
+        });
+        // Note: totalReceived stays 0 for losing orders
       }
     });
 
@@ -699,20 +897,38 @@ app.post("/api/resolve-event", async (req, res) => {
       userRefunds[order.clerkId] += refundAmount;
 
       if (!userPayouts[order.clerkId]) {
-        userPayouts[order.clerkId] = { winnings: 0, refunds: 0, orders: [] };
+        userPayouts[order.clerkId] = {
+          winnings: 0,
+          refunds: 0,
+          orders: [],
+          winningOrders: [],
+          losingOrders: [],
+          refundedOrders: [],
+          previousBalance: userBalances[order.clerkId] || 0,
+          totalSpent: 0,
+          totalReceived: 0,
+        };
       }
 
+      // For pending orders, we get back what we spent (refund)
       userPayouts[order.clerkId].refunds += refundAmount;
+      userPayouts[order.clerkId].totalSpent += refundAmount;
+      userPayouts[order.clerkId].totalReceived += refundAmount; // Refund counts as received
       userPayouts[order.clerkId].orders.push({
         ...order.toObject(),
         refund: refundAmount,
         type: "refund",
+        orderCost: refundAmount,
+      });
+      userPayouts[order.clerkId].refundedOrders.push({
+        ...order.toObject(),
+        refund: refundAmount,
+        orderCost: refundAmount,
       });
     });
 
     // Update user balances
     const updatePromises = [];
-    const notificationPromises = [];
 
     for (const [userId, payout] of Object.entries(userPayouts)) {
       const totalPayout = payout.winnings + payout.refunds;
@@ -741,31 +957,49 @@ app.post("/api/resolve-event", async (req, res) => {
       resolvedAt: new Date(),
     });
 
-    // Send notifications to all users
+    // Send notifications to all users with CORRECTED profit/loss data
     let userIndex = 0;
     for (const [userId, payout] of Object.entries(userPayouts)) {
       const totalPayout = payout.winnings + payout.refunds;
+      const previousBalance = payout.previousBalance;
 
+      // Get the updated user's new balance
+      let newBalance = previousBalance;
       if (totalPayout > 0) {
-        // Get the updated user's new balance
         const updatedUser = updatedUsers[userIndex];
-        const newBalance = updatedUser ? updatedUser.balance : totalPayout;
-
-        // Emit balance update with the new total balance, not just the payout
-        socketService.emitBalanceUpdate(userId, newBalance);
-
-        // Emit resolution notification
-        socketService.io.to(`user_${userId}`).emit("eventResolved", {
-          bidId,
-          resolution,
-          totalPayout,
-          winnings: payout.winnings,
-          refunds: payout.refunds,
-          orders: payout.orders,
-        });
-
+        newBalance = updatedUser
+          ? updatedUser.balance
+          : previousBalance + totalPayout;
         userIndex++;
       }
+
+      // CORRECTED CALCULATION: Actual profit/loss from this specific event
+      // Profit/Loss = Total Received - Total Spent
+      const actualProfitLoss = payout.totalReceived - payout.totalSpent;
+
+      // Emit balance update
+      if (totalPayout > 0) {
+        socketService.emitBalanceUpdate(userId, newBalance);
+      }
+
+      // Emit resolution notification with CORRECTED profit/loss data
+      socketService.io.to(`user_${userId}`).emit("eventResolved", {
+        bidId,
+        resolution,
+        totalPayout,
+        winnings: payout.winnings,
+        refunds: payout.refunds,
+        orders: payout.orders,
+        profitLoss: actualProfitLoss, // NEW: Actual profit/loss from this event
+        totalSpent: payout.totalSpent, // NEW: Total amount spent on this event
+        totalReceived: payout.totalReceived, // NEW: Total amount received back
+        previousBalance,
+        newBalance,
+        winningOrders: payout.winningOrders,
+        losingOrders: payout.losingOrders,
+        refundedOrders: payout.refundedOrders,
+        eventTitle: bid.question,
+      });
     }
 
     // Emit global resolution notification

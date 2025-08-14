@@ -56,6 +56,41 @@ const BidSchema = new Schema(
       type: Date,
       default: null,
     },
+
+    // NEW: Platform risk tracking fields
+    totalMoneyCollected: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    maxLiability: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    platformProfit: {
+      type: Number,
+      default: 0,
+    },
+    yesOrdersValue: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    noOrdersValue: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    // Track orders executed via house system vs matching
+    houseExecutedOrders: {
+      type: Number,
+      default: 0,
+    },
+    matchedOrders: {
+      type: Number,
+      default: 0,
+    },
   },
   {
     timestamps: true,
